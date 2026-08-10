@@ -29,10 +29,16 @@ func (s *Server) Echo() *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+	m := common.NewMetrics("scheduler")
 	e.Use(common.RequestID())
 	e.Use(common.PropagateRequestID())
+	e.Use(m.Middleware())
 	e.Use(common.RequestLogger(s.log))
 	e.Use(middleware.Recover())
+	m.Register(e)
+	// Бизнес-метрики рассылки регистрируются в том же регистре,
+	// что и HTTP-метрики: у сервиса должен быть ОДИН эндпоинт /metrics.
+	s.b.RegisterMetrics(m.Registry())
 
 	e.GET("/health", s.health)
 	e.GET("/ready", s.ready)

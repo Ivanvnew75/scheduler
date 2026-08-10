@@ -61,6 +61,21 @@ spec:
       maxSurge: 1
   template:
     metadata:
+      annotations:
+        # Аннотации для автообнаружения Prometheus.
+        #
+        # Это «классический» способ без оператора: Prometheus обходит
+        # все поды и скрейпит те, у кого стоит scrape=true. Плюс —
+        # ничего не нужно, кроме этих трёх строк. Минус — конфигурация
+        # сбора размазана по манифестам приложений, и централизованно
+        # изменить её (например, интервал) нельзя.
+        #
+        # Альтернатива в проде — Prometheus Operator и объекты
+        # ServiceMonitor/PodMonitor: сбор описывается отдельным ресурсом,
+        # приложение о нём не знает.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
       labels:
         app.kubernetes.io/name: scheduler
         app.kubernetes.io/part-of: moodbot

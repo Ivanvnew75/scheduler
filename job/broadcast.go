@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"github.com/Ivanvnew75/libs/common"
 )
 
@@ -29,13 +31,57 @@ type Broadcaster struct {
 	locker      *Locker
 	log         *slog.Logger
 	question    string
+
+	// Бизнес-метрики (Фактор 13).
+	//
+	// Технические метрики (rps, задержки) отвечают на вопрос «работает ли
+	// сервис». Бизнес-метрики отвечают на вопрос «делает ли он то, ради
+	// чего существует». Здесь это принципиально: scheduler может быть
+	// полностью здоров по всем HTTP-метрикам и при этом не разослать
+	// ни одного вопроса — например, если блокировка зависла или список
+	// пользователей пуст. Технические метрики этого НЕ покажут.
+	sent    prometheus.Counter
+	failed  prometheus.Counter
+	skipped prometheus.Counter
+	lastRun prometheus.Gauge
 }
 
 func NewBroadcaster(usersURL, telegramURL string, client *common.Client, locker *Locker, log *slog.Logger, question string) *Broadcaster {
+	const ns = "moodbot"
 	return &Broadcaster{
 		usersURL: usersURL, telegramURL: telegramURL,
 		client: client, locker: locker, log: log, question: question,
+
+		sent: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "broadcast_messages_sent_total",
+			Help: "Сколько вопросов успешно отправлено",
+		}),
+		failed: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "broadcast_messages_failed_total",
+			Help: "Сколько отправок не удалось",
+		}),
+		skipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: ns, Name: "broadcast_skipped_total",
+			Help: "Сколько рассылок пропущено из-за блокировки другой реплики",
+		}),
+		// Gauge с временем последнего запуска, а не Counter запусков.
+		//
+		// По нему пишется главный алерт этого сервиса:
+		//   time() - moodbot_broadcast_last_run_timestamp_seconds > 13*3600
+		// «рассылки не было дольше, чем должно» — то есть алерт
+		// на ОТСУТСТВИЕ события. Счётчиком такое не выразить:
+		// counter, который перестал расти, выглядит ровно как counter,
+		// по которому просто нет трафика.
+		lastRun: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: ns, Name: "broadcast_last_run_timestamp_seconds",
+			Help: "Время последней завершённой рассылки, unix seconds",
+		}),
 	}
+}
+
+// RegisterMetrics добавляет бизнес-метрики в общий регистр сервиса.
+func (b *Broadcaster) RegisterMetrics(reg *prometheus.Registry) {
+	reg.MustRegister(b.sent, b.failed, b.skipped, b.lastRun)
 }
 
 type Result struct {
@@ -60,6 +106,7 @@ func (b *Broadcaster) Run(ctx context.Context, slot string) (Result, error) {
 	}
 	if !ok {
 		// Не ошибка: другая реплика уже делает эту работу.
+		b.skipped.Inc()
 		b.log.Info("рассылка пропущена — блокировку держит другая реплика",
 			slog.String("slot", slot))
 		return Result{Skipped: true}, nil
@@ -89,14 +136,18 @@ func (b *Broadcaster) Run(ctx context.Context, slot string) (Result, error) {
 
 		if err != nil {
 			// Одна неудачная отправка не должна ронять всю рассылку.
+			b.failed.Inc()
 			res.Failed++
 			b.log.Error("отправка не удалась",
 				slog.Int64("user_id", u.ID),
 				slog.String("error", err.Error()))
 			continue
 		}
+		b.sent.Inc()
 		res.Sent++
 	}
+
+	b.lastRun.SetToCurrentTime()
 
 	b.log.Info("рассылка завершена",
 		slog.String("slot", slot),
