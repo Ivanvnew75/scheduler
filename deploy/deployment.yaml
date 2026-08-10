@@ -1,0 +1,133 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: scheduler
+    app.kubernetes.io/part-of: moodbot
+data:
+  SERVER_PORT: "8080"
+  LOG_LEVEL: "info"
+  LOG_FORMAT: "json"
+
+  USERS_SERVICE_URL: "http://users.moodbot.svc.cluster.local"
+  TELEGRAM_SERVICE_URL: "http://telegram-api.moodbot.svc.cluster.local"
+
+  # Redis без пароля — так он и поднят в infra/20-redis.yaml.
+  # В проде здесь была бы ссылка на Secret: в URL пароль виден
+  # в `kubectl get cm -o yaml` кому угодно с правами на чтение ConfigMap.
+  REDIS_URL: "redis://redis.moodbot.svc.cluster.local:6379/0"
+
+  # Расписание и зона — в конфигурации, не в коде.
+  SCHEDULE: "0 9,21 * * *"
+  TZ: "Europe/Moscow"
+
+  MOOD_QUESTION: "Как вы себя чувствуете?"
+  LOCK_TTL: "5m"
+  HTTP_TIMEOUT: "10s"
+  HTTP_RETRIES: "2"
+  SHUTDOWN_TIMEOUT: "15s"
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheduler
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: scheduler
+    app.kubernetes.io/part-of: moodbot
+spec:
+  # Две реплики при том, что рассылка должна произойти ровно один раз.
+  #
+  # Это работает, потому что взаимное исключение обеспечивает НЕ Kubernetes,
+  # а распределённая блокировка в Redis (job/lock.go). Реплики стартуют
+  # одновременно, обе видят наступление времени, обе идут за блокировкой,
+  # рассылку делает одна.
+  #
+  # Так и должно выглядеть stateless-приложение по Фактору 6: процессы
+  # взаимозаменяемы, координация вынесена в backing service.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: scheduler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: scheduler
+        app.kubernetes.io/part-of: moodbot
+    spec:
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: scheduler
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: scheduler
+          image: ghcr.io/ivanvnew75/scheduler:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: scheduler-config
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 25m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheduler
+  namespace: moodbot
+  labels:
+    app.kubernetes.io/name: scheduler
+    app.kubernetes.io/part-of: moodbot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: scheduler
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

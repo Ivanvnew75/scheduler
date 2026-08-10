@@ -1,0 +1,237 @@
+name: Build, release, run
+
+# Фактор 5 разложен на три отдельные job'ы, и это сделано намеренно.
+#
+#   build   — код превращается в образ. Не знает ни про окружения,
+#             ни про кластер. На выходе — неизменяемый артефакт.
+#   release — образ соединяется с конфигурацией окружения и получает
+#             собственный идентификатор. На выходе — отрендеренные
+#             манифесты, прибитые к digest'у образа.
+#   run     — release запускается. Ничего не собирает и не решает.
+#
+# Почему нельзя слить это в один шаг «docker build && kubectl apply»:
+#  * невозможно повторно выкатить старую версию, не пересобирая её
+#    (а пересборка того же коммита сегодня даст другой образ — базовый
+#    образ обновился, зависимости подтянулись новее);
+#  * невозможно ответить на вопрос «что именно сейчас в проде»;
+#  * откат превращается в «откатить коммит и подождать сборку»
+#    вместо «применить предыдущий release».
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# ВАЖНО про безопасность: в этом workflow есть job на self-hosted runner,
+# который стоит на личной машине. Триггера pull_request здесь НЕТ осознанно —
+# иначе любой человек мог бы прислать PR с произвольным кодом в workflow
+# и выполнить его на чужом компьютере. На публичных репозиториях
+# self-hosted runner + pull_request — известная дыра.
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # cancel-in-progress: false — деплой отменять на середине нельзя,
+  # это оставит кластер в промежуточном состоянии.
+  cancel-in-progress: false
+
+env:
+  # Имя образа в GHCR обязано быть в нижнем регистре, а github.repository
+  # отдаёт «Ivanvnew75/users». Поэтому имя владельца зашито строкой.
+  IMAGE: ghcr.io/ivanvnew75/scheduler
+
+jobs:
+  # ──────────────────────────── BUILD ────────────────────────────
+  build:
+    name: build (стадия 1)
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Вычислить теги образа
+        id: meta
+        run: |
+          SHA_SHORT=$(git rev-parse --short HEAD)
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="0.0.0-main.${SHA_SHORT}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${SHA_SHORT}" >> "$GITHUB_OUTPUT"
+          # Тега `latest` здесь нет и не будет.
+          # `latest` — движущаяся цель: два кластера с одним и тем же
+          # «latest» могут работать на разных образах, а откатиться
+          # к предыдущему latest нельзя, потому что его больше нет.
+          echo "Версия релиза: ${VERSION}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Логин в GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # GITHUB_TOKEN, а не личный PAT: он живёт только время job'ы
+          # и ограничен правами, объявленными в permissions выше.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Собрать и запушить
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ steps.meta.outputs.sha_short }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            COMMIT=${{ steps.meta.outputs.sha_short }}
+          # Кэш слоёв в GitHub Actions cache: сборка Go-модулей
+          # не повторяется на каждом пуше.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Показать digest
+        run: |
+          echo "Собран образ:"
+          echo "  ${{ env.IMAGE }}:${{ steps.meta.outputs.version }}"
+          echo "  digest: ${{ steps.push.outputs.digest }}"
+
+  # ─────────────────────────── RELEASE ───────────────────────────
+  release:
+    name: release (стадия 2)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить kubectl (фиксированной версии)
+        # Версия прибита гвоздями, а не «последняя». Плавающая версия
+        # инструмента в CI — это сборка, которая ломается сама по себе
+        # в случайный день, без единого коммита в репозиторий.
+        run: |
+          KUBECTL_VERSION=v1.31.4
+          curl -fsSLo /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Собрать release — образ + конфигурация
+        env:
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p release/overlay
+
+          # Оверлей поверх базы deploy/, который прибивает образ к DIGEST,
+          # а не к тегу.
+          #
+          # Почему digest: тег в registry можно перезаписать — `docker push
+          # :1.2.3` поверх существующего 1.2.3 молча подменит содержимое.
+          # Digest — это хеш манифеста образа, подменить его невозможно.
+          # «Релиз неизменяем» (Фактор 5) достигается только так.
+          cat > release/overlay/kustomization.yaml <<EOF
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          resources:
+            - ../../deploy
+          images:
+            - name: ghcr.io/ivanvnew75/scheduler
+              digest: ${DIGEST}
+          EOF
+
+          kubectl kustomize release/overlay > release/manifests.yaml
+
+          # Метаданные релиза: по ним потом можно ответить
+          # «что именно сейчас работает и из какого коммита собрано».
+          cat > release/RELEASE <<EOF
+          release_id=${{ github.run_number }}
+          version=${{ needs.build.outputs.version }}
+          commit=${{ github.sha }}
+          image_digest=${{ needs.build.outputs.digest }}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          echo "=== RELEASE ==="; cat release/RELEASE
+          echo "=== образ в манифесте ==="
+          grep -n "image:" release/manifests.yaml
+
+      - name: Опубликовать артефакт релиза
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ github.run_number }}
+          path: release/
+          retention-days: 30
+
+  # ───────────────────────────── RUN ─────────────────────────────
+  run:
+    name: run (стадия 3, self-hosted)
+    needs: [build, release]
+    # Раннер на машине Ивана: GitHub-облако до локального kind-кластера
+    # не достучится физически. Метка `kind` — чтобы job не уехала
+    # на случайный чужой self-hosted runner.
+    runs-on: [self-hosted, kind]
+    environment: production
+    steps:
+      - name: Забрать артефакт релиза
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.run_number }}
+          path: release
+
+      - name: Показать, что выкатываем
+        run: cat release/RELEASE
+
+      - name: Применить релиз
+        env:
+          KUBECONFIG: /home/ivan/.kube/config
+        run: |
+          set -euo pipefail
+          kubectl config use-context kind-devopstrain
+
+          # Стадия run НИЧЕГО не собирает и не рендерит — она применяет
+          # готовый артефакт. Если бы здесь был `kustomize build`,
+          # результат зависел бы от состояния файлов на раннере,
+          # и «выкатили тот же релиз» перестало бы быть правдой.
+          kubectl apply -f release/manifests.yaml
+
+          kubectl -n moodbot rollout status deployment/scheduler --timeout=180s
+
+      - name: Проверить по данным, а не по статусу
+        env:
+          KUBECONFIG: /home/ivan/.kube/config
+        run: |
+          set -euo pipefail
+          # Статус rollout говорит только «поды поднялись». Реальная
+          # проверка — сходить в сервис через Service и получить ответ.
+          kubectl -n moodbot port-forward svc/scheduler 18099:80 &
+          PF=$!
+          trap 'kill $PF 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS localhost:18099/ready > /dev/null 2>&1; then break; fi
+          done
+          echo "GET /ready -> $(curl -fsS localhost:18099/ready)"
+
+          # Главная проверка scheduler'а — что он разобрал расписание
+          # и знает время следующего запуска. Если тут UTC вместо
+          # Europe/Moscow — рассылка уедет на три часа, и увидеть это
+          # надо здесь, а не по жалобе пользователя.
+          echo "--- лог ---"
+          kubectl -n moodbot logs deployment/scheduler --tail=20
+
+      - name: Зафиксировать выкаченный образ
+        env:
+          KUBECONFIG: /home/ivan/.kube/config
+        run: |
+          echo -n "В кластере сейчас: "
+          kubectl -n moodbot get deploy scheduler \
+            -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'

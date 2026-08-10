@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Не отформатированы gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      # Проверяем, что go.mod/go.sum не разъехались.
+      # `go mod tidy` в CI с последующим `git diff --exit-code` ловит
+      # ситуацию «добавил импорт, забыл tidy» — она проявляется как
+      # неожиданная ошибка сборки у следующего человека.
+      - name: go mod tidy не меняет файлы
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
