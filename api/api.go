@@ -9,6 +9,8 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 
+	"github.com/Ivanvnew75/libs/common"
+
 	"github.com/Ivanvnew75/scheduler/job"
 )
 
@@ -27,6 +29,9 @@ func (s *Server) Echo() *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	e.HidePort = true
+	e.Use(common.RequestID())
+	e.Use(common.PropagateRequestID())
+	e.Use(common.RequestLogger(s.log))
 	e.Use(middleware.Recover())
 
 	e.GET("/health", s.health)

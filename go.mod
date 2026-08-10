@@ -3,7 +3,7 @@ module github.com/Ivanvnew75/scheduler
 go 1.26.5
 
 require (
-	github.com/Ivanvnew75/libs v0.1.0
+	github.com/Ivanvnew75/libs v0.2.1
 	github.com/labstack/echo/v4 v4.15.4
 	github.com/redis/go-redis/v9 v9.22.0
 	github.com/robfig/cron/v3 v3.0.1

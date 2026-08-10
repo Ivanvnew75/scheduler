@@ -1,5 +1,5 @@
-github.com/Ivanvnew75/libs v0.1.0 h1:5/tjmIAC8yAIwrZHQT3dB3evAgnIjK8QeVeZb+ko+rc=
-github.com/Ivanvnew75/libs v0.1.0/go.mod h1:ovwrK4bMSftHR9Ckm/vRsIZbGHQs2V+Fi9XXS4eAlf8=
+github.com/Ivanvnew75/libs v0.2.1 h1:vyYoIpmYGkipVu3egqru/u/RGVoYtUbI24BG2diGq2A=
+github.com/Ivanvnew75/libs v0.2.1/go.mod h1:bw190OHBYqhiVnFO6/6DQBXLqggQwkEgBnByL2o70wM=
 github.com/bsm/ginkgo/v2 v2.12.0 h1:Ny8MWAHyOepLGlLKYmXG4IEkioBysk6GpaRTLC8zwWs=
 github.com/bsm/ginkgo/v2 v2.12.0/go.mod h1:SwYbGRRDovPVboqFv0tPTcG1sN61LM1Z4ARdbAV9g4c=
 github.com/bsm/gomega v1.27.10 h1:yeMWxP2pV2fG3FgAODIY8EiRE3dy0aeFYt4l7wh6yKA=
