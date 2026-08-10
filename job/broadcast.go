@@ -84,6 +84,42 @@ func (b *Broadcaster) RegisterMetrics(reg *prometheus.Registry) {
 	reg.MustRegister(b.sent, b.failed, b.skipped, b.lastRun)
 }
 
+// lastRunKey — где хранится время последней рассылки.
+const lastRunKey = "moodbot:broadcast:last_run"
+
+// RestoreLastRun поднимает время последней рассылки из Redis при старте.
+//
+// ЗАЧЕМ ЭТО НУЖНО — найдено проверкой, а не придумано.
+//
+// Gauge, зарегистрированный и не заполненный, экспортируется со значением 0.
+// Алерт `time() - broadcast_last_run_timestamp_seconds > 13h` при нуле
+// даёт «прошло 496 210 часов» и срабатывает СРАЗУ ПОСЛЕ КАЖДОЙ ВЫКАТКИ.
+// Ложная тревога после каждого деплоя — быстрый способ приучить дежурного
+// игнорировать алерты этого сервиса.
+//
+// Причина глубже, чем «забыли инициализировать»: состояние «когда была
+// последняя рассылка» хранилось в памяти процесса и терялось при рестарте.
+// Это ровно нарушение Фактора 6. Правильное место для него — backing
+// service, тот же Redis, который уже используется для блокировки.
+//
+// Запасной вариант (Redis пуст, первый запуск в жизни) — время старта
+// процесса: тогда алерт даст отсрочку в свои 13 часов, а не выстрелит.
+func (b *Broadcaster) RestoreLastRun(ctx context.Context) {
+	ts, err := b.locker.GetLastRun(ctx, lastRunKey)
+	switch {
+	case err != nil:
+		b.log.Warn("не удалось прочитать время последней рассылки",
+			slog.String("error", err.Error()))
+		b.lastRun.SetToCurrentTime()
+	case ts.IsZero():
+		b.log.Info("время последней рассылки неизвестно, беру время старта")
+		b.lastRun.SetToCurrentTime()
+	default:
+		b.lastRun.Set(float64(ts.Unix()))
+		b.log.Info("восстановлено время последней рассылки", slog.Time("at", ts))
+	}
+}
+
 type Result struct {
 	Skipped bool `json:"skipped"`
 	Total   int  `json:"total"`
@@ -147,7 +183,13 @@ func (b *Broadcaster) Run(ctx context.Context, slot string) (Result, error) {
 		res.Sent++
 	}
 
-	b.lastRun.SetToCurrentTime()
+	now := time.Now()
+	b.lastRun.Set(float64(now.Unix()))
+	// Пишем в Redis, чтобы значение пережило рестарт пода.
+	if err := b.locker.SetLastRun(ctx, lastRunKey, now); err != nil {
+		b.log.Warn("не удалось сохранить время рассылки",
+			slog.String("error", err.Error()))
+	}
 
 	b.log.Info("рассылка завершена",
 		slog.String("slot", slot),

@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"time"
@@ -39,6 +40,9 @@ func (s *Server) Echo() *echo.Echo {
 	// Бизнес-метрики рассылки регистрируются в том же регистре,
 	// что и HTTP-метрики: у сервиса должен быть ОДИН эндпоинт /metrics.
 	s.b.RegisterMetrics(m.Registry())
+	// Восстанавливаем время последней рассылки из Redis, иначе алерт
+	// «рассылки давно не было» выстрелит сразу после выкатки.
+	s.b.RestoreLastRun(context.Background())
 
 	e.GET("/health", s.health)
 	e.GET("/ready", s.ready)

@@ -88,3 +88,22 @@ func (l *Locker) Acquire(ctx context.Context, key string) (release func(), ok bo
 }
 
 func (l *Locker) Ping(ctx context.Context) error { return l.rdb.Ping(ctx).Err() }
+
+// SetLastRun/GetLastRun — небольшое состояние, которое обязано пережить
+// рестарт пода. Хранится БЕЗ TTL, в отличие от блокировки: блокировка
+// обязана истекать, а факт «рассылка была тогда-то» — нет.
+func (l *Locker) SetLastRun(ctx context.Context, key string, t time.Time) error {
+	return l.rdb.Set(ctx, key, t.Unix(), 0).Err()
+}
+
+func (l *Locker) GetLastRun(ctx context.Context, key string) (time.Time, error) {
+	v, err := l.rdb.Get(ctx, key).Int64()
+	if err == redis.Nil {
+		// Ключа нет — это не ошибка, а «ещё ни разу не рассылали».
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(v, 0), nil
+}
