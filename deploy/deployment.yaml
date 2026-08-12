@@ -81,6 +81,12 @@ spec:
         app.kubernetes.io/part-of: moodbot
     spec:
       terminationGracePeriodSeconds: 30
+      # Свой ServiceAccount и БЕЗ монтирования его токена.
+      # Сервис к API Kubernetes не обращается, значит токен ему не нужен;
+      # а лежащий в контейнере токен — это готовый ключ к API для того,
+      # кто добьётся выполнения кода. Курс Next Level, задание 16.
+      serviceAccountName: scheduler
+      automountServiceAccountToken: false
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
